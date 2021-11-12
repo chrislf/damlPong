@@ -1,0 +1,128 @@
+{-# LANGUAGE ApplicativeDo #-}
+
+module Game where
+
+import Daml.Script
+
+type PaddlePosition = Int
+
+type Paddles = (PaddlePosition, PaddlePosition)
+
+type Location = (Int, Int)
+
+type Velocity = (Int, Int)
+
+type Ball = (Location, Velocity)
+
+type Bounds = (Int, Int)
+
+data RunBallResult =
+    OffLeft
+  | OffRight
+  | Returned Ball
+  deriving (Show)
+
+runBall : Bounds -> Paddles -> Ball -> RunBallResult
+runBall b@(bx, by) p@(lpCentre, rpCentre) ball@((x, y), (dx, dy))
+  | x > bx && (abs (y-rpCentre) < 10) = runBall b p ((x - dx, y + dy), (-dx, dy))
+  | x > bx = OffRight
+  | x < 0 && (abs (y-lpCentre) < 10) = runBall b p ((x - dx, y + dy), (-dx, dy))
+  | x < 0  = OffLeft
+  | dx > 0 && x > (bx / 2) && x - dx < (bx / 2) = Returned ball -- cross the middle heading right
+  | dx < 0 && x < (bx / 2) && x - dx > (bx / 2) = Returned ball -- ditto heading left
+  | y < 0 = runBall b p ((x + dx, y - dy), (dx, -dy))
+  | y > by = runBall b p ((x + dx, y - dy), (dx, -dy))
+  | otherwise = runBall b p ((x + dx, y + dy), (dx, dy))
+
+
+template Game
+  with
+    leftPlayer : Party
+    rightPlayer : Party
+    paddles : (PaddlePosition, PaddlePosition)
+    score : (Int, Int)
+    ball : Ball
+    winner : Optional Party
+    currentPlayer : Party
+    bounds : Bounds
+  where
+
+    let otherPlayer = if currentPlayer == leftPlayer then rightPlayer else leftPlayer
+        isLeft p = p == leftPlayer
+
+    signatory currentPlayer, otherPlayer
+    observer otherPlayer, currentPlayer
+
+    nonconsuming choice TakeTurn: ContractId Game with
+        player : Party
+        delta : Int
+      controller currentPlayer
+      do
+        assertMsg "not your turn" (player == currentPlayer)
+        assertMsg "Game over, man, game over" (winner == None)
+        assertMsg "Max move 10" (abs delta <= 10)
+        archive self
+        let newPaddles = if isLeft currentPlayer
+                          then (max 0 (fst paddles + delta), snd paddles)
+                          else (fst paddles, max 0 (snd paddles + delta))
+        case runBall bounds paddles ball of
+          OffLeft -> do
+            let newScore = (fst score, succ (snd score))
+            if snd newScore == 10
+              then
+                create this with winner = Some rightPlayer  -- exercise GameOver instead
+              else
+                create this with currentPlayer = otherPlayer, paddles = newPaddles, ball = ((fst bounds / 2, snd bounds / 2), (10, 10)), score = newScore  -- TODO pseudorandom velocity
+          OffRight -> do
+            let newScore = (succ (fst score), snd score)
+            if fst newScore == 10
+              then
+                create this with winner = Some leftPlayer  -- exercise GameOver instead
+              else
+                create this with currentPlayer = otherPlayer, paddles = newPaddles, ball = ((fst bounds / 2, snd bounds / 2), (-10, 10)), score = newScore  -- TODO pseudorandom velocity
+          Returned ball' -> do
+            create this with ball = ball', currentPlayer = otherPlayer, paddles = newPaddles
+
+    choice GameOver: ContractId Game
+      controller currentPlayer
+      do
+        case compare (fst score) (snd score) of
+          GT -> create this with winner = Some leftPlayer
+          LT -> create this with winner = Some rightPlayer
+          EQ -> abort "can't have game over with equal scores" -- what's the idiomatic way to do this?
+
+game_test = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  let go = submitMulti [alice, bob] []
+      stop = submitMultiMustFail [alice, bob] []
+
+  game <- go do
+    createCmd Game with leftPlayer = alice , rightPlayer = bob, paddles = (50, 50), score = (0,0), ball = ((50, 50), (10, 10)), winner = None, currentPlayer = alice, bounds = (100, 100)
+
+
+  -- take turn
+  game1 <- go do
+    exerciseCmd game $ TakeTurn alice 10
+
+  -- alice can't take two goes in a row
+  stop do
+    exerciseCmd game1 $ TakeTurn alice (-2)
+
+  game2 <- go do
+    exerciseCmd game1 $ TakeTurn bob 10
+
+  -- does not go up to 11
+  stop do
+    exerciseCmd game2 $ TakeTurn alice 11
+
+  go do
+    exerciseCmd game2 $ TakeTurn alice 4
+
+--  game3 <- go do
+--    exerciseCmd game2 $ TakeTurn alice 4
+
+--  -- right has won
+--  go do
+--    -- can we verify right has won?
+--    exerciseCmd game3 GameOver
